@@ -1,0 +1,15 @@
+LICENSE
+README.md
+pyproject.toml
+src/hantek6254bc/__init__.py
+src/hantek6254bc/cli.py
+src/hantek6254bc/device.py
+src/hantek6254bc/errors.py
+src/hantek6254bc/transport.py
+src/hantek6254bc_linux.egg-info/PKG-INFO
+src/hantek6254bc_linux.egg-info/SOURCES.txt
+src/hantek6254bc_linux.egg-info/dependency_links.txt
+src/hantek6254bc_linux.egg-info/entry_points.txt
+src/hantek6254bc_linux.egg-info/requires.txt
+src/hantek6254bc_linux.egg-info/top_level.txt
+tests/test_device.py

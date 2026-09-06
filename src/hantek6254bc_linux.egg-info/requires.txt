@@ -1,0 +1,9 @@
+pyusb>=1.2.1
+numpy>=1.24
+
+[plot]
+matplotlib>=3.7
+PyQt6>=6.6
+
+[test]
+pytest>=8

@@ -1,0 +1,3 @@
+# Hantek 6074/6104/6204/6254 BC/BD USB oscilloscope
+SUBSYSTEM=="usb", ATTR{idVendor}=="04b5", ATTR{idProduct}=="6cde", TAG+="uaccess", MODE="0660"
+
