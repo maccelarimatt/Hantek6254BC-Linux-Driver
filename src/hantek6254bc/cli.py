@@ -4,8 +4,9 @@ import argparse
 import csv
 from pathlib import Path
 import sys
+import time
 
-from .device import Hantek6254BC, RATE_TABLE, SUPPORTED_DEPTHS, ScopeConfig
+from .device import Hantek6254BC, RATE_TABLE, STREAM_MAX_RATE, SUPPORTED_DEPTHS, ScopeConfig, wire_to_volts
 from .errors import HantekError
 from .transport import UsbTransport
 
@@ -84,6 +85,32 @@ def capture_command(args) -> int:
     return 0
 
 
+def stream_command(args) -> int:
+    """Record continuously in ROLL mode for a fixed time and save every sample."""
+    import numpy as np
+
+    config = ScopeConfig(sample_rate=args.rate, volts_per_div=args.vdiv)
+    output = Path(args.output)
+    chunks, lost = [], 0
+    with Hantek6254BC.open(config=config, bus=args.bus, address=args.device) as scope:
+        stream = scope.stream()
+        started = time.monotonic()
+        try:
+            for chunk in stream:
+                chunks.append(chunk.raw)
+                lost += chunk.lost_frames
+                if time.monotonic() - started >= args.seconds:
+                    break
+        finally:
+            stream.close()
+    raw = np.concatenate(chunks, axis=1)
+    np.savez_compressed(output, raw=raw, volts=wire_to_volts(raw, config.volts_per_div),
+                        sample_rate=config.sample_rate, lost_frames=lost)
+    print(f"Streamed {raw.shape[1]:,} samples/channel at {config.sample_rate:,} S/s "
+          f"({raw.shape[1] / config.sample_rate:.1f} s), {lost} lost -> {output}")
+    return 0 if lost == 0 else 1
+
+
 def live_command(args) -> int:
     config = _config(args)
     from .gui import run_gui
@@ -101,6 +128,15 @@ def build_parser() -> argparse.ArgumentParser:
     capture_parser.add_argument("output", nargs="?", default="capture.csv")
     _add_capture_args(capture_parser)
     capture_parser.set_defaults(func=capture_command)
+
+    stream_parser = sub.add_parser("stream", help="record continuously (ROLL mode) to a .npz file")
+    stream_parser.add_argument("output", nargs="?", default="stream.npz")
+    _add_usb_args(stream_parser)
+    stream_parser.add_argument("--seconds", type=float, default=10.0)
+    stream_parser.add_argument("--rate", type=_number, default=25_000,
+                               choices=[r for r in RATE_TABLE if r <= STREAM_MAX_RATE], help="sample rate")
+    stream_parser.add_argument("--vdiv", type=_vdiv, default=(1.0,) * 4, help="V/div: one value or CH1,CH2,CH3,CH4")
+    stream_parser.set_defaults(func=stream_command)
 
     live_parser = sub.add_parser("live", help="display continuously captured waveforms")
     _add_capture_args(live_parser)
