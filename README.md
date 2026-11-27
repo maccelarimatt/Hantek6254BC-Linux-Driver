@@ -74,6 +74,25 @@ Trigger example (channel numbers on the command line are 1 through 4):
 
 Use `hantek6254bc capture --help` for all options. Supported sample rates are 25 kS/s, 50 kS/s, 125 kS/s, 250 kS/s, 500 kS/s, 1.25 MS/s, 2.5 MS/s, 5 MS/s, 12.5 MS/s, 25 MS/s, 50 MS/s, 125 MS/s, and 250 MS/s. Supported memory depths are 4096, 8192, and 16384 samples per channel.
 
+## Continuous streaming (ROLL mode)
+
+`capture()` records one burst into the scope's 64 KB memory, stops, and reads it out, so there is a gap between bursts. `stream()` instead starts the hardware's ROLL mode (bit 1 of the vendor SDK's `dsoHTStartCollectData` start control, sent as `0x03 0x00 0x02 0x00`). The FPGA then writes all four channels round its memory without stopping, and the driver follows the write pointer (bytes 2-3 of the `0x0D` response) and reads everything behind it while acquisition continues. Every sample is delivered exactly once, in order:
+
+```python
+from hantek6254bc import Hantek6254BC, ScopeConfig, wire_to_volts
+
+with Hantek6254BC.open(ScopeConfig(sample_rate=25_000)) as scope:
+    for chunk in scope.stream():           # StreamChunk every ~20 ms
+        volts = wire_to_volts(chunk.raw, scope.config.volts_per_div)
+        ...                                # chunk.first_frame counts samples on the scope clock
+```
+
+The memory holds 0.655 s at 25 kS/s, so the consumer must ask for the next chunk well within that; hand chunks to another thread for processing. If it falls further behind, the overwritten samples are counted exactly in `chunk.lost_frames` rather than silently joined. `chunk.host_ns` and `chunk.host_frame` tie the scope's sample clock to host time. Streaming is limited to 25 and 50 kS/s; it was verified on hardware at 25 kS/s by following a 60 Hz sine for 30 s with no lost or repeated samples.
+
+```sh
+.venv/bin/hantek6254bc stream stream.npz --seconds 60 --vdiv 1
+```
+
 ## Current limitations
 
 - Four-channel acquisition mode only. The hardware's faster one- and two-channel interleaved modes are not enabled.

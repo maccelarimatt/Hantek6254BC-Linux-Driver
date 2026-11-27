@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import struct
 import time
-from typing import Protocol
+from typing import Iterator, Protocol
 
 import numpy as np
 from numpy.typing import NDArray
@@ -12,6 +12,12 @@ from .errors import ProtocolError
 from .transport import UsbTransport
 
 SUPPORTED_DEPTHS = (4096, 8192, 16384)
+CHANNELS = 4
+PACKET_BYTES = 512
+RAM_BYTES = 65536          # Circular capture memory: 4 interleaved channels x 16384 frames
+ROLL_MODE = 0x02           # dsoHTStartCollectData nStartControl bit 1 (bit 0 = auto, bit 2 = single)
+STREAM_MAX_RATE = 50_000   # ROLL streaming verified at 25 kS/s; faster rates leave too little headroom
+STREAM_GUARD_BYTES = 16384 # Never read closer than this to being overwritten (0.16 s at 25 kS/s)
 SUPPORTED_VDIV = (0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0)
 
 # divider command, timing template bytes, timer base, correction A, correction B
@@ -72,6 +78,35 @@ class Capture:
     volts: NDArray[np.float64]
     raw: NDArray[np.uint8]
     sample_rate: int
+
+
+@dataclass(frozen=True)
+class StreamChunk:
+    """Consecutive frames read from the scope while it records continuously in ROLL mode.
+
+    Frames are counted on the scope's sample clock from the start of the stream, so
+    chunk.first_frame + n of one chunk equals the next chunk's first_frame unless
+    lost_frames > 0 (the reader fell more than the memory behind and those frames were
+    overwritten before they could be read).
+    """
+    raw: NDArray[np.uint8]   # (4, n) wire codes; n is a multiple of 128 frames
+    first_frame: int         # Stream frame index of raw[:, 0]
+    lost_frames: int         # Frames lost immediately before this chunk (0 = contiguous)
+    host_ns: int             # Host time.time_ns() just after the write pointer was read
+    host_frame: int          # Stream frame the scope was about to write at host_ns
+    backlog_bytes: int       # Unread bytes in scope memory at that pointer read (65536 = full)
+    sample_rate: int
+
+
+def wire_to_volts(raw: NDArray[np.uint8], volts_per_div) -> NDArray[np.float64]:
+    """Convert (4, n) wire codes to volts as the vendor software does."""
+    # The FPGA wire format spans codes 28..228. The vendor implementation
+    # expands those 200 codes to the nominal 8-bit 0..255 sample range.
+    samples = np.floor((raw.astype(float) - 28.0) * (256.0 / 200.0) + 0.5)
+    samples = np.clip(samples, 0.0, 255.0)
+    scales = np.asarray(volts_per_div, dtype=float)[:, None]
+    # The vendor API uses 31 normalized ADC codes per vertical division.
+    return (samples - 128.0) / 31.0 * scales
 
 
 class Hantek6254BC:
@@ -356,16 +391,78 @@ class Hantek6254BC:
         frame = self._read_capture_memory(byte_count)
         interleaved = np.frombuffer(frame, dtype=np.uint8)
         raw = interleaved.reshape((-1, 4)).T.copy()
-        # The FPGA wire format spans codes 28..228. The vendor implementation
-        # expands those 200 codes to the nominal 8-bit 0..255 sample range.
-        samples = np.floor((raw.astype(float) - 28.0) * (256.0 / 200.0) + 0.5)
-        samples = np.clip(samples, 0.0, 255.0)
-        centers = np.full((4, 1), 128.0)
-        scales = np.asarray(self.config.volts_per_div, dtype=float)[:, None]
-        # The vendor API uses 31 normalized ADC codes per vertical division.
-        volts = (samples - centers) / 31.0 * scales
+        volts = wire_to_volts(raw, self.config.volts_per_div)
         time_s = np.arange(self.config.depth, dtype=float) / self.config.sample_rate
         return Capture(time_s=time_s, volts=volts, raw=raw, sample_rate=self.config.sample_rate)
+
+    def _roll_pointer(self) -> tuple[int, float]:
+        """Byte address the FPGA writes next in ROLL mode, and host monotonic time after reading it."""
+        self._command(b"\x0d\x00")
+        response = self.transport.read(PACKET_BYTES)
+        now = time.monotonic()
+        if len(response) < 4:
+            raise ProtocolError("write-pointer response is too short")
+        address = response[2] | response[3] << 8
+        if address % CHANNELS:
+            raise ProtocolError(f"write pointer 0x{address:04x} is not on a 4-channel frame boundary")
+        return address, now
+
+    def _read_memory(self, address: int, byte_count: int) -> bytes:
+        """Read capture memory from any frame-aligned address (reads wrap at 64 KB)."""
+        packets = byte_count // PACKET_BYTES
+        if byte_count % PACKET_BYTES or not 0 < packets <= 128:
+            raise ProtocolError("memory reads must be 1 to 128 whole USB packets")
+        address %= RAM_BYTES
+        self._command(bytes((0x0E, 0, address & 0xFF, address >> 8)))
+        self._command(bytes((0x05, 0, 0, packets)))
+        return b"".join(self.transport.read(PACKET_BYTES, timeout_ms=5000) for _ in range(packets))
+
+    def stream(self, poll_interval: float = 0.02) -> Iterator[StreamChunk]:
+        """Record continuously in ROLL mode and yield every frame exactly once, in order.
+
+        In ROLL mode the FPGA never stops: it writes all four channels round its 64 KB
+        memory (0.655 s at 25 kS/s) while this generator follows the write pointer
+        (bytes 2-3 of the 0x0D response) and reads everything behind it. Nothing is
+        lost as long as the consumer asks for the next chunk well within that time;
+        if it falls further behind, the overwritten frames are reported in
+        StreamChunk.lost_frames, never silently joined. Close the generator to stop.
+        """
+        if not self._initialized:
+            raise ProtocolError("scope has not been initialized")
+        if self.config.sample_rate > STREAM_MAX_RATE:
+            raise ValueError(f"ROLL streaming supports sample rates up to {STREAM_MAX_RATE} S/s")
+        rate = CHANNELS * self.config.sample_rate  # Bytes written per second
+        self._command(bytes((0x03, 0, ROLL_MODE, 0)))
+        time.sleep(0.05)  # As in the hardware verification: let ROLL acquisition settle first
+        base, last_t = self._roll_pointer()  # Stream byte 0: the first byte written after this read
+        last_address = base
+        written = consumed = 0  # Stream bytes written by the FPGA / handed to the caller
+        while True:
+            loop_start = time.monotonic()
+            address, now = self._roll_pointer()
+            host_ns = time.time_ns()
+            step = (address - last_address) % RAM_BYTES
+            expected = (now - last_t) * rate
+            # The pointer is only 16 bits; after a stall longer than the memory it has
+            # wrapped, and the host clock says how many times.
+            step += RAM_BYTES * max(0, round((expected - step) / RAM_BYTES))
+            if abs(step - expected) > RAM_BYTES / 4:
+                raise ProtocolError(f"write pointer moved {step} bytes in {now - last_t:.3f} s; "
+                                    f"expected about {expected:.0f}")
+            written += step
+            last_address, last_t = address, now
+            backlog = written - consumed
+            lost = max(0, backlog - (RAM_BYTES - STREAM_GUARD_BYTES))
+            consumed += lost
+            packets = (written - consumed) // PACKET_BYTES
+            if packets:
+                data = self._read_memory(base + consumed, packets * PACKET_BYTES)
+                raw = np.frombuffer(data, dtype=np.uint8).reshape((-1, CHANNELS)).T.copy()
+                yield StreamChunk(raw=raw, first_frame=consumed // CHANNELS, lost_frames=lost // CHANNELS,
+                                  host_ns=host_ns, host_frame=written // CHANNELS,
+                                  backlog_bytes=min(backlog, RAM_BYTES), sample_rate=self.config.sample_rate)
+                consumed += packets * PACKET_BYTES
+            time.sleep(max(0.0, poll_interval - (time.monotonic() - loop_start)))
 
     def close(self) -> None:
         self.transport.close()
